@@ -18,22 +18,66 @@ pk = np.loadtxt('../data/ics_matterpow_0.dat')
 ipklin = iuspline(pk[:, 0], pk[:, 1])
 
 print('loaded')
-
-for seed in range(100, 10000, 100):
-
-    print(seed)
-##    initial_conditions = flowpm.linear_field(nc,          # size of the cube
-##                                             bs,         # Physical size of the cube
-##                                             ipklin,      # Initial powerspectrum
-##                                             seed=seed,
-##                                             batch_size=1)
 ##
-    ick = tools.readbigfile('../data/L%d-N%d-B1-T%d/S%d/linear/LinearDensityK/'%(bs, nc, nsteps, seed))
-    ic = np.fft.irfftn(ick)*nc**3
-    initial_conditions = tf.cast(tf.expand_dims(tf.constant(ic), 0), tf.float32) - 1.
-    
+##for seed in range(10, 10000, 10):
+##
+##    print(seed)
+##    path = '../data/make_data_code/L%d-N%d-B1-T%d/S%d/'%(bs, nc, nsteps, seed)
+##
+##    if os.path.isdir(path ):
+##        if not os.path.isfile(path + '/fpm-d'):
+##            #ick = tools.readbigfile(path + '/linear/LinearDensityK/')
+##            #ic = np.fft.irfftn(ick)*nc**3
+##            ic = tools.readbigfile(path + '/mesh/s/')
+##            initial_conditions = tf.cast(tf.expand_dims(tf.constant(ic), 0), tf.float32) - 1.
+##
+##            print(initial_conditions)
+##
+##            # Sample particles
+##            state = flowpm.lpt_init(initial_conditions, a0=ainit)   
+##
+##            # Evolve particles down to z=0
+##            final_state = flowpm.nbody(state, stages, nc)         
+##
+##            # Retrieve final density field
+##            final_field = flowpm.cic_paint(tf.zeros_like(initial_conditions), final_state[0])
+##
+##
+##            with tf.Session() as sess:
+##                #ic, sim = sess.run([initial_conditions, final_field])
+##                sim = sess.run(final_field)
+##
+##            print(ic.mean())
+##            #np.save(path + '/fpm-s', np.squeeze(ic))
+##            np.save(path + '/fpm-d', np.squeeze(sim))
+##        else:
+##            print(path + '/fpm-d' + ' exists')
+##    else:
+##        print(path + ' does not exist')
+##        
+##
+
+
+
+for ss in range(1900, 2000, 100):
+
+    print(ss)
+    seeds = np.arange(ss, ss+100, 10)
+
+    ic = []
+    for iseed, seed in enumerate(seeds):
+        path = '../data/make_data_code/L%d-N%d-B1-T%d/S%d/'%(bs, nc, nsteps, seed)
+        ic.append(tools.readbigfile(path + '/mesh/s/'))
+
+    ic = np.stack(ic)
+    print(ic.shape)
+    print(ic.mean())
+
+    initial_conditions = tf.cast(tf.constant(ic), tf.float32) 
+        
+
     print(initial_conditions)
-    
+
     # Sample particles
     state = flowpm.lpt_init(initial_conditions, a0=ainit)   
 
@@ -45,10 +89,12 @@ for seed in range(100, 10000, 100):
 
 
     with tf.Session() as sess:
-        ic, sim = sess.run([initial_conditions, final_field])
-        #sim = sess.run(final_field)
+        #ic, sim = sess.run([initial_conditions, final_field])
+        sim = sess.run(final_field)
 
-    print(ic.mean())
-    np.save('../data/L%d-N%d-B1-T%d/S%d/fpm-s'%(bs, nc, nsteps, seed), np.squeeze(ic))
-    np.save('../data/L%d-N%d-B1-T%d/S%d/fpm-d'%(bs, nc, nsteps, seed), np.squeeze(sim))
+    print(sim.shape)
+    #np.save(path + '/fpm-s', np.squeeze(ic))
+    for iseed, seed in enumerate(seeds):
+        path = '../data/make_data_code/L%d-N%d-B1-T%d/S%d/'%(bs, nc, nsteps, seed)
+        np.save(path + '/fpm-d', np.squeeze(sim[iseed]))
 

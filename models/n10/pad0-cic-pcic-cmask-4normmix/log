@@ -1,0 +1,8 @@
+Features are :  ['cic']
+Target are :  ['pcic']
+Model Name :  _mdn_mask_model_fn
+Distribution :  normal
+Masktype :  constant
+No. of components :  4
+Pad with :  0
+Rotation probability = 0.50

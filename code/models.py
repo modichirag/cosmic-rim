@@ -9,6 +9,8 @@ import tensorflow.contrib.slim as slim
 from tensorflow.contrib.slim import add_arg_scope
 from layers import wide_resnet, wide_resnet_snorm, valid_resnet
 from layers import  wide_resnet_snorm
+from pixelcnn3d import *
+
 from tfops import specnormconv3d, dynamic_deconv3d
 import tensorflow_hub as hub
 import tensorflow_probability
@@ -290,6 +292,129 @@ def _mdn_mask_model_fn(features, labels, nchannels, n_y, n_mixture, dropout, opt
 
 
 
+def _mdn_pixmodel_fn(features, labels, nchannels, n_y, n_mixture, dropout, optimizer, mode, pad, 
+                     cfilter_size=None, f_map=8, distribution='normal'):
+
+    # Check for training mode                                                                                                   
+    is_training = mode == tf.estimator.ModeKeys.TRAIN
+
+    def _module_fn():
+        """                                                                                                                     
+        Function building the module                                                                                            
+        """
+
+
+        feature_layer = tf.placeholder(tf.float32, shape=[None, None, None, None, nchannels], name='input')
+        obs_layer = tf.placeholder(tf.float32, shape=[None, None, None, None, n_y], name='observations')
+
+        conditional_im = wide_resnet(feature_layer, 16, activation_fn=tf.nn.leaky_relu, 
+                                     keep_prob=dropout, is_training=is_training)
+        conditional_im = wide_resnet(conditional_im, 16, activation_fn=tf.nn.leaky_relu, 
+                                      keep_prob=dropout, is_training=is_training)
+        conditional_im = wide_resnet(conditional_im, 1, activation_fn=tf.nn.leaky_relu, 
+                                      keep_prob=dropout, is_training=is_training)
+        conditional_im = tf.concat((feature_layer, conditional_im), -1)
+
+        # Builds the neural network                                                                                             
+        ul = [[obs_layer]]
+        for i in range(10):
+            #ul.append(PixelCNN3Dlayer(i, ul[i], f_map=f_map, full_horizontal=True, h=None, 
+            #                          conditional_im=conditional_im, cfilter_size=cfilter_size, gatedact='sigmoid'))
+            ul.append(PixelCNN3Dlayer(i, ul[i], f_map=f_map, full_horizontal=True, h=None, 
+                                      #conditional_im = conditional_im,
+                                      convconditional=conditional_im,
+                                      cfilter_size=cfilter_size, gatedact='sigmoid'))
+
+        h_stack_in = ul[-1][-1]
+
+        with tf.variable_scope("fc_1"):
+            fc1 = GatedCNN([1, 1, 1, 1], h_stack_in, orientation=None, gated=False, mask='b').output()
+
+        with tf.variable_scope("fc_2"):
+            fc2 = GatedCNN([1, 1, 1, n_mixture*3*n_y], fc1, orientation=None, 
+                                gated=False, mask='b', activation=False).output()
+
+        
+        cube_size = tf.shape(obs_layer)[1]
+        net = tf.reshape(fc2, [-1, cube_size, cube_size, cube_size, n_y, n_mixture*3])
+
+        loc, unconstrained_scale, logits = tf.split(net,
+                                                    num_or_size_splits=3,
+                                                    axis=-1)
+        scale = tf.nn.softplus(unconstrained_scale) + 1e-3
+
+        # Form mixture of discretized logistic distributions. Note we shift the                                                 
+        # logistic distribution by -0.5. This lets the quantization capture "rounding"                                          
+        # intervals, `(x-0.5, x+0.5]`, and not "ceiling" intervals, `(x-1, x]`.                                                 
+        if distribution == 'logistic':
+            discretized_logistic_dist = tfd.QuantizedDistribution(
+                distribution=tfd.TransformedDistribution(
+                    distribution=tfd.Logistic(loc=loc, scale=scale),
+                    bijector=tfb.AffineScalar(shift=-0.5)),
+                low=0.,
+                high=2.**3-1)
+
+            mixture_dist = tfd.MixtureSameFamily(
+                mixture_distribution=tfd.Categorical(logits=logits),
+                components_distribution=discretized_logistic_dist)
+
+        elif distribution == 'normal':
+
+            mixture_dist = tfd.MixtureSameFamily(
+                mixture_distribution=tfd.Categorical(logits=logits),
+                components_distribution=tfd.Normal(loc=loc, scale=scale))
+
+        # Define a function for sampling, and a function for estimating the log likelihood                                      
+        #sample = tf.squeeze(mixture_dist.sample())                                                                             
+        sample = mixture_dist.sample()
+        loglik = mixture_dist.log_prob(obs_layer)
+        hub.add_signature(inputs={'features':feature_layer, 'labels':obs_layer},
+                          outputs={'sample':sample, 'loglikelihood':loglik,
+                                   'loc':loc, 'scale':scale, 'logits':logits})
+
+    # Create model and register module if necessary                                                                     
+    spec = hub.create_module_spec(_module_fn)
+    module = hub.Module(spec, trainable=True)
+    if isinstance(features,dict):
+        predictions = module(features, as_dict=True)
+    else:
+        predictions = module({'features':features, 'labels':labels}, as_dict=True)
+
+    if mode == tf.estimator.ModeKeys.PREDICT:
+        hub.register_module_for_export(module, "likelihood")
+        return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+
+    loglik = predictions['loglikelihood']
+    # Compute and register loss function                                                                                
+    neg_log_likelihood = -tf.reduce_sum(loglik, axis=-1)
+    neg_log_likelihood = tf.reduce_mean(neg_log_likelihood)
+
+    tf.losses.add_loss(neg_log_likelihood)
+    total_loss = tf.losses.get_total_loss(add_regularization_losses=True)
+
+    train_op = None
+    eval_metric_ops = None
+
+    # Define optimizer                                                                                                  
+    if mode == tf.estimator.ModeKeys.TRAIN:
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+            global_step=tf.train.get_global_step()
+            boundaries = list(np.array([2e3, 5e3, 1e4, 2e4, 3e4]).astype(int))
+            values = [1e-3, 5e-4, 1e-4, 5e-5, 1e-5, 1e-6]
+            learning_rate = tf.train.piecewise_constant(global_step, boundaries, values)
+            train_op = optimizer(learning_rate=learning_rate).minimize(loss=total_loss, global_step=global_step)
+            tf.summary.scalar('rate', learning_rate)
+        tf.summary.scalar('loss', neg_log_likelihood)
+    elif mode == tf.estimator.ModeKeys.EVAL:
+
+        eval_metric_ops = { "log_p": neg_log_likelihood}
+
+    return tf.estimator.EstimatorSpec(mode=mode,
+                                      predictions=predictions,
+                                      loss=total_loss,
+                                      train_op=train_op,
+                                      eval_metric_ops=eval_metric_ops)
 
 
 
